@@ -1,5 +1,7 @@
 #pragma once
 
+#include <chrono>
+
 #include <boost/process.hpp>
 #include "velox/connectors/Connector.h"
 #include "velox/connectors/clp/ClpConfig.h"
@@ -17,6 +19,8 @@ class ClpDataSource : public DataSource {
           std::shared_ptr<connector::ColumnHandle>>& columnHandles,
       velox::memory::MemoryPool* pool,
       std::shared_ptr<const ClpConfig>& clpConfig);
+
+  ~ClpDataSource() override;
 
   void addSplit(std::shared_ptr<ConnectorSplit> split) override;
 
@@ -55,6 +59,7 @@ class ClpDataSource : public DataSource {
       uint64_t index,
       T value,
       std::string typeSuffix) {
+    auto start = std::chrono::high_resolution_clock::now();
     if (auto iter = columnIndices_.find(path); iter != columnIndices_.end()) {
       auto vector = vectors[iter->second]->asFlatVector<T>();
       vector->set(index, value);
@@ -67,6 +72,8 @@ class ClpDataSource : public DataSource {
         vector->setNull(index, false);
       }
     }
+    setValuesDuration_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::high_resolution_clock::now() - start);
   }
 
   std::string executablePath_;
@@ -74,7 +81,8 @@ class ClpDataSource : public DataSource {
   std::string kqlQuery_;
   bool polymorphicTypeEnabled_;
   velox::memory::MemoryPool* pool_;
-  boost::process::ipstream resultsStream_;
+//  boost::process::ipstream resultsStream_;
+  std::ifstream resultsStream_;
   RowTypePtr outputType_;
   std::vector<std::string> columnUntypedNames_;
   std::map<std::string, size_t> columnIndices_;
@@ -82,5 +90,12 @@ class ClpDataSource : public DataSource {
   uint64_t completedRows_{0};
   uint64_t completedBytes_{0};
   boost::process::child process_;
+  // Parse duration
+  std::chrono::nanoseconds parseDuration_{0};
+  std::chrono::nanoseconds parseLoopDuration_{0};
+  std::chrono::nanoseconds getLineDuration_{0};
+  std::chrono::nanoseconds setValuesDuration_{0};
+  std::chrono::nanoseconds vectorInitiationDuration_{0};
+  std::chrono::nanoseconds clpDataSourceDuration_{0};
 };
 } // namespace facebook::velox::connector::clp
