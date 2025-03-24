@@ -49,6 +49,16 @@ endif()
 velox_link_libraries(velox_functions_prestosql velox_functions_prestosql_impl
                      velox_is_null_functions simdjson::simdjson)
 
+if(VELOX_ENABLE_GEO)
+  velox_compile_definitions(velox_functions_prestosql PRIVATE VELOX_ENABLE_GEO)
+  if(VELOX_MONO_LIBRARY)
+    target_compile_options(velox PRIVATE -Wno-cpp)
+  else()
+    target_compile_options(velox_functions_prestosql PRIVATE -Wno-cpp)
+  endif()
+  velox_link_libraries(velox_functions_prestosql GEOS::geos)
+endif()
+
 if(NOT VELOX_MONO_LIBRARY)
   set_property(TARGET velox_functions_prestosql PROPERTY JOB_POOL_COMPILE
                                                          high_memory_pool)
