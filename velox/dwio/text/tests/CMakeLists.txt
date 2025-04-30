@@ -23,4 +23,5 @@ set(TEST_LINK_LIBS
     gflags::gflags
     glog::glog)
 
+add_subdirectory(reader)
 add_subdirectory(writer)

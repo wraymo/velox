@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "velox/dwio/text/common/Common.h"
 #include "velox/dwio/text/writer/TextWriter.h"
 
 #include <utility>

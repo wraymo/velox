@@ -33,23 +33,6 @@ struct WriterOptions : public dwio::common::WriterOptions {
   int64_t defaultFlushCount = 10 << 10;
 };
 
-// TODO: move to a separate file to be shared with text reader once it is in oss
-class TextFileTraits {
- public:
-  //// The following constants define the delimiters used by TextFile format.
-  /// Each row is separated by 'kNewLine'.
-  /// Each column is separated by 'kSOH' within each row.
-
-  /// String for null data.
-  static inline const std::string kNullData = "\\N";
-
-  /// Delimiter between columns.
-  static const char kSOH = '\x01';
-
-  /// Delimiter between rows.
-  static const char kNewLine = '\n';
-};
-
 /// Encodes Velox vectors in TextFormat and writes into a FileSink.
 class TextWriter : public dwio::common::Writer {
  public:
