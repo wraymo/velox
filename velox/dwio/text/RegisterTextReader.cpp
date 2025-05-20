@@ -1,5 +1,5 @@
 /*
-* Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Facebook, Inc. and its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,12 +18,12 @@
 
 namespace facebook::velox::text {
 
-    void registerTextReaderFactory() {
-        dwio::common::registerReaderFactory(std::make_shared<TextReaderFactory>());
-    }
+void registerTextReaderFactory() {
+  dwio::common::registerReaderFactory(std::make_shared<TextReaderFactory>());
+}
 
-    void unregisterTextReaderFactory() {
-        dwio::common::unregisterReaderFactory(dwio::common::FileFormat::TEXT);
-    }
+void unregisterTextReaderFactory() {
+  dwio::common::unregisterReaderFactory(dwio::common::FileFormat::TEXT);
+}
 
 } // namespace facebook::velox::text

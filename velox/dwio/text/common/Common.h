@@ -1,5 +1,5 @@
 /*
-* Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Facebook, Inc. and its affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,18 +20,18 @@
 namespace facebook::velox::text {
 
 class TextFileTraits {
-public:
-    //// The following constants define the delimiters used by TextFile format.
-    /// Each row is separated by 'kNewLine'.
-    /// Each column is separated by 'kSOH' within each row.
+ public:
+  //// The following constants define the delimiters used by TextFile format.
+  /// Each row is separated by 'kNewLine'.
+  /// Each column is separated by 'kSOH' within each row.
 
-    /// String for null data.
-    static inline const std::string kNullData = "\\N";
+  /// String for null data.
+  static inline const std::string kNullData = "\\N";
 
-    /// Delimiter between columns.
-    static const char kSOH = '\x01';
+  /// Delimiter between columns.
+  static const char kSOH = '\x01';
 
-    /// Delimiter between rows.
-    static const char kNewLine = '\n';
+  /// Delimiter between rows.
+  static const char kNewLine = '\n';
 };
 } // namespace facebook::velox::text
