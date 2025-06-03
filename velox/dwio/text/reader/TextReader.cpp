@@ -32,13 +32,14 @@ ReaderBase::ReaderBase(
           dwio::common::TypeWithId::create(schema_))},
       memoryPool_(&options_.memoryPool()) {}
 
-void ReaderBase::createVector(VectorPtr& result, vector_size_t size) const {
+void ReaderBase::createVector(RowTypePtr& type, VectorPtr& result, vector_size_t size) const {
   if (!result) {
-    result = BaseVector::create(schema_, size, memoryPool_);
+    result = BaseVector::create(type, size, memoryPool_);
   } else {
     VELOX_CHECK(
-        result->type()->equivalent(*schema_),
+        result->type()->equivalent(*type),
         "Result vector type does not match the expected schema.");
+    result->resize(size);
   }
 }
 
@@ -53,19 +54,41 @@ TextRowReader::TextRowReader(
     const std::shared_ptr<ReaderBase>& reader,
     const dwio::common::RowReaderOptions& options)
     : readerBase_(reader),
+      requestedType_{options.requestedType() ? options.requestedType()
+                           : readerBase_->schema()},
+      fileSchema_{readerBase_->schema()},
+      fieldDelim_{readerBase_->serdeOptions().separators[0]},
       row_{0},
       fileLength_{readerBase_->fileLength()},
       fileOffset_{0},
       blockEndOffset_{0},
       bufferPtr_{nullptr},
       bufferSize_{0},
-      bufferOffset_{0} {}
+      bufferOffset_{0} {
+  std::vector<std::string> names;
+  std::vector<TypePtr> types;
+  auto& scanSpec = options.scanSpec();
+  auto& childSpecs = scanSpec->children();
+  for (auto i = 0; i < childSpecs.size(); ++i) {
+    auto childSpec = childSpecs[i];
+    if (!childSpec->readFromFile()) {
+      continue;
+    }
+    auto index = fileSchema_->getChildIdx(childSpec->fieldName());
+    fileIndexToOutputIndex_[index] = i;
+    auto childRequestedType =
+        requestedType_->asRow().findChild(childSpec->fieldName());
+    names.push_back(childSpec->fieldName());
+    types.push_back(childRequestedType);
+  }
+  outputType_ = ROW(std::move(names), std::move(types));
+}
 
 uint64_t TextRowReader::next(
     uint64_t size,
     VectorPtr& result,
     const dwio::common::Mutation* /*mutation*/) {
-  readerBase_->createVector(result, size);
+  readerBase_->createVector(outputType_, result, size);
   auto rowResult = result->as<RowVector>();
 
   int32_t row = 0;
@@ -124,6 +147,7 @@ uint64_t TextRowReader::next(
     }
   }
 
+  result->resize(row);
   row_ += row;
   return row;
 }
@@ -145,27 +169,23 @@ void TextRowReader::processLine(
 
   while (start <= line.size()) {
     VELOX_CHECK_LT(
-        columnIndex, result->childrenSize(), "Too many columns in line");
+        columnIndex, fileSchema_->size(), "Too many columns in line");
 
-    std::size_t end = line.find(TextFileTraits::kSOH, start);
+    std::size_t end = line.find(fieldDelim_, start);
     bool isLast = (end == std::string::npos);
     std::string_view token =
         isLast ? line.substr(start) : line.substr(start, end - start);
+    auto it = fileIndexToOutputIndex_.find(columnIndex);
+    if (it != fileIndexToOutputIndex_.end()) {
+      writeColumnValue(result->childAt(it->second), row, token);
+    }
 
-    writeColumnValue(result->childAt(columnIndex++), row, token);
-
+    columnIndex++;
     if (isLast) {
       break;
     }
     start = end + 1;
   }
-
-  VELOX_CHECK_EQ(
-      columnIndex,
-      result->childrenSize(),
-      "Column count mismatch: expected {}, got {}",
-      result->childrenSize(),
-      columnIndex);
 }
 
 template <TypeKind KIND>

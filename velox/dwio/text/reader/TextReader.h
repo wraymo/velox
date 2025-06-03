@@ -29,7 +29,6 @@ namespace facebook::velox::text {
 
 class ReaderBase {
  public:
-  /// Creates reader base from buffered input.
   ReaderBase(
       dwio::common::ReaderOptions options,
       std::unique_ptr<dwio::common::BufferedInput> input);
@@ -46,7 +45,11 @@ class ReaderBase {
     return input_->getReadFile()->size();
   }
 
-  void createVector(VectorPtr& result, vector_size_t size) const;
+  const dwio::common::SerDeOptions& serdeOptions() {
+    return options_.serDeOptions();
+  }
+
+  void createVector(RowTypePtr& type, VectorPtr& result, vector_size_t size) const;
 
   std::unique_ptr<dwio::common::SeekableInputStream> loadBlock(
       common::Region region) const;
@@ -102,6 +105,13 @@ class TextRowReader : public dwio::common::RowReader {
 
   std::shared_ptr<ReaderBase> readerBase_;
   std::unique_ptr<dwio::common::SeekableInputStream> stream_;
+
+  RowTypePtr requestedType_;
+  RowTypePtr outputType_;
+  RowTypePtr fileSchema_;
+  std::unordered_map<uint32_t, uint32_t> fileIndexToOutputIndex_;
+
+  uint8_t fieldDelim_;
 
   uint64_t row_;
   uint64_t fileLength_;
