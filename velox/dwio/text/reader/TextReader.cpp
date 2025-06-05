@@ -20,6 +20,7 @@
 #include "velox/dwio/common/TypeWithId.h"
 #include "velox/dwio/text/common/Common.h"
 #include "velox/dwio/text/reader/TextReader.h"
+#include "velox/type/TimestampConversion.h"
 
 namespace facebook::velox::text {
 ReaderBase::ReaderBase(
@@ -28,18 +29,13 @@ ReaderBase::ReaderBase(
     : options_{std::move(options)},
       input_{std::move(input)},
       schema_{options_.fileSchema()},
-      typeWithId_{std::shared_ptr<const dwio::common::TypeWithId>(
-          dwio::common::TypeWithId::create(schema_))},
-      memoryPool_(&options_.memoryPool()) {}
-
-void ReaderBase::createVector(RowTypePtr& type, VectorPtr& result, vector_size_t size) const {
-  if (!result) {
-    result = BaseVector::create(type, size, memoryPool_);
+      memoryPool_(&options_.memoryPool()) {
+  if (options_.scanSpec()) {
+    typeWithId_ = std::shared_ptr<dwio::common::TypeWithId>(
+        dwio::common::TypeWithId::create(schema_, *options_.scanSpec()));
   } else {
-    VELOX_CHECK(
-        result->type()->equivalent(*type),
-        "Result vector type does not match the expected schema.");
-    result->resize(size);
+    typeWithId_ = std::shared_ptr<dwio::common::TypeWithId>(
+        dwio::common::TypeWithId::create(schema_));
   }
 }
 
@@ -54,10 +50,12 @@ TextRowReader::TextRowReader(
     const std::shared_ptr<ReaderBase>& reader,
     const dwio::common::RowReaderOptions& options)
     : readerBase_(reader),
-      requestedType_{options.requestedType() ? options.requestedType()
-                           : readerBase_->schema()},
+      requestedType_{
+          options.requestedType() ? options.requestedType()
+                                  : readerBase_->schema()},
       fileSchema_{readerBase_->schema()},
       fieldDelim_{readerBase_->serdeOptions().separators[0]},
+      collectionDelim_{readerBase_->serdeOptions().separators[1]},
       row_{0},
       fileLength_{readerBase_->fileLength()},
       fileOffset_{0},
@@ -69,27 +67,27 @@ TextRowReader::TextRowReader(
   std::vector<TypePtr> types;
   auto& scanSpec = options.scanSpec();
   auto& childSpecs = scanSpec->children();
-  for (auto i = 0; i < childSpecs.size(); ++i) {
-    auto childSpec = childSpecs[i];
-    if (!childSpec->readFromFile()) {
+  for (const auto& childSpec : childSpecs) {
+    if (!childSpec->projectOut()) {
       continue;
     }
-    auto index = fileSchema_->getChildIdx(childSpec->fieldName());
-    fileIndexToOutputIndex_[index] = i;
-    auto childRequestedType =
-        requestedType_->asRow().findChild(childSpec->fieldName());
-    names.push_back(childSpec->fieldName());
-    types.push_back(childRequestedType);
+    if (childSpec->isConstant()) {
+      constantColumnVectors_[childSpec->channel()] = childSpec->constantValue();
+    } else if (childSpec->readFromFile()) {
+      auto fileIndex = fileSchema_->getChildIdx(childSpec->fieldName());
+      auto channel = childSpec->channel();
+      fileIndexToSetters_[fileIndex] = {
+          channel, makeSetter(fileSchema_->childAt(fileIndex))};
+    }
   }
-  outputType_ = ROW(std::move(names), std::move(types));
 }
 
 uint64_t TextRowReader::next(
     uint64_t size,
     VectorPtr& result,
     const dwio::common::Mutation* /*mutation*/) {
-  readerBase_->createVector(outputType_, result, size);
   auto rowResult = result->as<RowVector>();
+  rowResult->ensureWritable(SelectivityVector(size, true));
 
   int32_t row = 0;
   while (row < size) {
@@ -148,6 +146,10 @@ uint64_t TextRowReader::next(
   }
 
   result->resize(row);
+  for (const auto& [channel, valueVector] : constantColumnVectors_) {
+    rowResult->childAt(channel) =
+        BaseVector::wrapInConstant(row, 0, valueVector);
+  }
   row_ += row;
   return row;
 }
@@ -175,9 +177,16 @@ void TextRowReader::processLine(
     bool isLast = (end == std::string::npos);
     std::string_view token =
         isLast ? line.substr(start) : line.substr(start, end - start);
-    auto it = fileIndexToOutputIndex_.find(columnIndex);
-    if (it != fileIndexToOutputIndex_.end()) {
-      writeColumnValue(result->childAt(it->second), row, token);
+    auto it = fileIndexToSetters_.find(columnIndex);
+    if (it != fileIndexToSetters_.end()) {
+      auto channel = it->second.first;
+      auto setter = it->second.second;
+      if (token == TextFileTraits::kNullData) {
+        result->childAt(channel)->setNull(row, true);
+      } else {
+        setter(result->childAt(channel), row, token);
+      }
+      setter(result->childAt(channel), row, token);
     }
 
     columnIndex++;
@@ -188,6 +197,151 @@ void TextRowReader::processLine(
   }
 }
 
+void TextRowReader::writeRowValue(
+    const std::vector<SetterFunction>& childSetters,
+    VectorPtr& vector,
+    vector_size_t row,
+    std::string_view value) const {
+  auto rowVector = vector->as<RowVector>();
+  auto children = rowVector->children();
+
+  std::size_t columnIndex = 0;
+  std::size_t start = 0;
+
+  while (start <= value.size()) {
+    VELOX_CHECK_LT(columnIndex, children.size(), "Too many columns in line");
+
+    std::size_t end = value.find(collectionDelim_, start);
+    bool isLast = (end == std::string::npos);
+    std::string_view token =
+        isLast ? value.substr(start) : value.substr(start, end - start);
+    if (token == TextFileTraits::kNullData) {
+      children[columnIndex]->setNull(row, true);
+    } else {
+      childSetters[columnIndex](children[columnIndex], row, token);
+    }
+    columnIndex++;
+    if (isLast) {
+      break;
+    }
+    start = end + 1;
+  }
+
+  VELOX_CHECK_EQ(columnIndex, children.size(), "{}: ROW field count mismatch");
+}
+
+TextRowReader::SetterFunction TextRowReader::makeSetter(const TypePtr& type) {
+  switch (type->kind()) {
+    case TypeKind::BOOLEAN:
+      return [this](VectorPtr& vec, vector_size_t row, std::string_view val) {
+        vec->as<FlatVector<bool>>()->set(
+            row, castFromString<TypeKind::BOOLEAN>(val));
+      };
+    case TypeKind::TINYINT:
+      return [this](VectorPtr& vec, vector_size_t row, std::string_view val) {
+        vec->as<FlatVector<int8_t>>()->set(
+            row, castFromString<TypeKind::TINYINT>(val));
+      };
+    case TypeKind::SMALLINT:
+      return [this](VectorPtr& vec, vector_size_t row, std::string_view val) {
+        vec->as<FlatVector<int16_t>>()->set(
+            row, castFromString<TypeKind::SMALLINT>(val));
+      };
+    case TypeKind::INTEGER:
+      return [this, isDate = type->isDate()](
+                 VectorPtr& vec, vector_size_t row, std::string_view val) {
+        auto flat = vec->as<FlatVector<int32_t>>();
+        flat->set(
+            row,
+            isDate ? castFromDateString(val)
+                   : castFromString<TypeKind::INTEGER>(val));
+      };
+    case TypeKind::BIGINT:
+      return [this](VectorPtr& vec, vector_size_t row, std::string_view val) {
+        vec->as<FlatVector<int64_t>>()->set(
+            row, castFromString<TypeKind::BIGINT>(val));
+      };
+    case TypeKind::REAL:
+      return [this](VectorPtr& vec, vector_size_t row, std::string_view val) {
+        vec->as<FlatVector<float>>()->set(
+            row, castFromString<TypeKind::REAL>(val));
+      };
+    case TypeKind::DOUBLE:
+      return [this](VectorPtr& vec, vector_size_t row, std::string_view val) {
+        vec->as<FlatVector<double>>()->set(
+            row, castFromString<TypeKind::DOUBLE>(val));
+      };
+    case TypeKind::VARCHAR:
+      return [](VectorPtr& vec, vector_size_t row, std::string_view val) {
+        vec->as<FlatVector<StringView>>()->set(
+            row, StringView(val.data(), val.size()));
+      };
+    case TypeKind::VARBINARY:
+      return [](VectorPtr& vec, vector_size_t row, std::string_view val) {
+        auto decodedValue = encoding::Base64::decode({val.data(), val.size()});
+        vec->as<FlatVector<StringView>>()->set(row, StringView(decodedValue));
+      };
+    case TypeKind::TIMESTAMP:
+      return [this](VectorPtr& vec, vector_size_t row, std::string_view val) {
+        vec->as<FlatVector<Timestamp>>()->set(
+            row, castFromString<TypeKind::TIMESTAMP>(val));
+      };
+    case TypeKind::ARRAY: {
+      auto arrayType = std::dynamic_pointer_cast<const ArrayType>(type);
+      auto elementSetter = makeSetter(arrayType->elementType());
+      return [this, arrayType, elementSetter = std::move(elementSetter)](
+                 VectorPtr& vector, vector_size_t row, std::string_view value) {
+        writeArrayValue(elementSetter, vector, row, value);
+      };
+    }
+    case TypeKind::ROW: {
+      auto rowType = std::dynamic_pointer_cast<const RowType>(type);
+      std::vector<SetterFunction> childSetters;
+      for (auto& child : rowType->children()) {
+        childSetters.push_back(makeSetter(child));
+      }
+      return [this, childSetters = std::move(childSetters)](
+                 VectorPtr& vector, vector_size_t row, std::string_view value) {
+        writeRowValue(childSetters, vector, row, value);
+      };
+    }
+    default:
+      VELOX_UNSUPPORTED("Unsupported type: {}", type->toString());
+  }
+}
+
+void TextRowReader::writeArrayValue(
+    const SetterFunction& setter,
+    VectorPtr& columnVector,
+    int32_t row,
+    std::string_view value) const {
+  auto arrayVector = columnVector->as<ArrayVector>();
+  auto elementsVector = arrayVector->elements();
+
+  std::vector<std::string_view> elements;
+  std::size_t start = 0;
+  while (start <= value.size()) {
+    std::size_t end = value.find(collectionDelim_, start);
+    bool isLast = (end == std::string::npos);
+    std::string_view token =
+        isLast ? value.substr(start) : value.substr(start, end - start);
+    elements.push_back(token);
+    if (isLast) {
+      break;
+    }
+    start = end + 1;
+  }
+
+  const vector_size_t offset = elementsVector->size();
+  const vector_size_t length = elements.size();
+  elementsVector->resize(offset + length);
+  for (size_t i = 0; i < length; ++i) {
+    setter(elementsVector, offset + i, elements[i]);
+  }
+
+  arrayVector->setOffsetAndSize(row, offset, length);
+}
+
 template <TypeKind KIND>
 typename TypeTraits<KIND>::NativeType TextRowReader::castFromString(
     const std::string_view& value) {
@@ -196,63 +350,11 @@ typename TypeTraits<KIND>::NativeType TextRowReader::castFromString(
   return result.value();
 }
 
-void TextRowReader::writeColumnValue(
-    VectorPtr& columnVector,
-    int32_t row,
-    const std::string_view& value) {
-  if (value == TextFileTraits::kNullData) {
-    columnVector->setNull(row, true);
-    return;
-  }
-
-  auto type = columnVector->type()->kind();
-  switch (type) {
-    case TypeKind::BOOLEAN:
-      columnVector->as<FlatVector<bool>>()->set(
-          row, castFromString<TypeKind::BOOLEAN>(value));
-      break;
-    case TypeKind::TINYINT:
-      columnVector->as<FlatVector<int8_t>>()->set(
-          row, castFromString<TypeKind::TINYINT>(value));
-      break;
-    case TypeKind::SMALLINT:
-      columnVector->as<FlatVector<int16_t>>()->set(
-          row, castFromString<TypeKind::SMALLINT>(value));
-      break;
-    case TypeKind::INTEGER:
-      columnVector->as<FlatVector<int32_t>>()->set(
-          row, castFromString<TypeKind::INTEGER>(value));
-      break;
-    case TypeKind::BIGINT:
-      columnVector->as<FlatVector<int64_t>>()->set(
-          row, castFromString<TypeKind::BIGINT>(value));
-      break;
-    case TypeKind::REAL:
-      columnVector->as<FlatVector<float>>()->set(
-          row, castFromString<TypeKind::REAL>(value));
-      break;
-    case TypeKind::DOUBLE:
-      columnVector->as<FlatVector<double>>()->set(
-          row, castFromString<TypeKind::DOUBLE>(value));
-      break;
-    case TypeKind::VARCHAR:
-      columnVector->as<FlatVector<StringView>>()->set(
-          row, StringView(value.data(), value.size()));
-      break;
-    case TypeKind::VARBINARY: {
-      auto decodedValue =
-          encoding::Base64::decode({value.data(), value.size()});
-      columnVector->as<FlatVector<StringView>>()->set(
-          row, StringView(decodedValue));
-      break;
-    }
-    case TypeKind::TIMESTAMP:
-      columnVector->as<FlatVector<Timestamp>>()->set(
-          row, castFromString<TypeKind::TIMESTAMP>(value));
-      break;
-    default:
-      VELOX_NYI("Unsupported type: {}", columnVector->type()->toString());
-  }
+int32_t TextRowReader::castFromDateString(const std::string_view& value) {
+  auto result = util::fromDateString(
+      value.data(), value.size(), util::ParseMode::kPrestoCast);
+  VELOX_CHECK(!result.hasError());
+  return result.value();
 }
 
 TextReader::TextReader(

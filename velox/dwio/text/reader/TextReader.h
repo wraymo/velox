@@ -49,8 +49,6 @@ class ReaderBase {
     return options_.serDeOptions();
   }
 
-  void createVector(RowTypePtr& type, VectorPtr& result, vector_size_t size) const;
-
   std::unique_ptr<dwio::common::SeekableInputStream> loadBlock(
       common::Region region) const;
 
@@ -58,7 +56,7 @@ class ReaderBase {
   const dwio::common::ReaderOptions options_;
   const std::unique_ptr<dwio::common::BufferedInput> input_;
   const RowTypePtr schema_;
-  const std::shared_ptr<const dwio::common::TypeWithId> typeWithId_;
+  std::shared_ptr<const dwio::common::TypeWithId> typeWithId_;
   memory::MemoryPool* memoryPool_;
 };
 
@@ -90,16 +88,31 @@ class TextRowReader : public dwio::common::RowReader {
   }
 
  private:
+  using SetterFunction =
+      std::function<void(VectorPtr&, vector_size_t, std::string_view)>;
+
+  SetterFunction makeSetter(const TypePtr& type);
+
+  void writeRowValue(
+      const std::vector<std::function<
+          void(VectorPtr&, vector_size_t, std::string_view)>>& childSetters,
+      VectorPtr& vector,
+      vector_size_t row,
+      std::string_view value) const;
+
+  void writeArrayValue(
+      const SetterFunction& setter,
+      VectorPtr& columnVector,
+      int32_t row,
+      std::string_view value) const;
+
   void processLine(RowVector* result, int32_t row, std::string_view line);
 
   template <TypeKind KIND>
   typename TypeTraits<KIND>::NativeType castFromString(
       const std::string_view& value);
 
-  void writeColumnValue(
-      VectorPtr& columnVector,
-      int32_t row,
-      const std::string_view& value);
+  static int32_t castFromDateString(const std::string_view& value);
 
   static constexpr uint64_t kBlockSize = 1024 * 1024; // 1MB
 
@@ -109,9 +122,13 @@ class TextRowReader : public dwio::common::RowReader {
   RowTypePtr requestedType_;
   RowTypePtr outputType_;
   RowTypePtr fileSchema_;
-  std::unordered_map<uint32_t, uint32_t> fileIndexToOutputIndex_;
+
+  std::unordered_map<uint32_t, std::pair<uint32_t, SetterFunction>>
+      fileIndexToSetters_;
+  std::unordered_map<uint32_t, VectorPtr> constantColumnVectors_;
 
   uint8_t fieldDelim_;
+  uint8_t collectionDelim_;
 
   uint64_t row_;
   uint64_t fileLength_;
