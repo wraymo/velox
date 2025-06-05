@@ -186,7 +186,6 @@ void TextRowReader::processLine(
       } else {
         setter(result->childAt(channel), row, token);
       }
-      setter(result->childAt(channel), row, token);
     }
 
     columnIndex++;
@@ -203,13 +202,15 @@ void TextRowReader::writeRowValue(
     vector_size_t row,
     std::string_view value) const {
   auto rowVector = vector->as<RowVector>();
-  auto children = rowVector->children();
+  auto& children = rowVector->children();
 
   std::size_t columnIndex = 0;
   std::size_t start = 0;
 
-  while (start <= value.size()) {
-    VELOX_CHECK_LT(columnIndex, children.size(), "Too many columns in line");
+  auto childrenSize = children.size();
+  auto valueSize = value.size();
+  while (columnIndex < childrenSize && start <= valueSize) {
+    VELOX_CHECK_LT(columnIndex, childrenSize, "Too many columns in line");
 
     std::size_t end = value.find(collectionDelim_, start);
     bool isLast = (end == std::string::npos);
@@ -227,7 +228,9 @@ void TextRowReader::writeRowValue(
     start = end + 1;
   }
 
-  VELOX_CHECK_EQ(columnIndex, children.size(), "{}: ROW field count mismatch");
+  for (auto i = columnIndex; i < childrenSize; ++i) {
+    children[i]->setNull(row, true);
+  }
 }
 
 TextRowReader::SetterFunction TextRowReader::makeSetter(const TypePtr& type) {
