@@ -91,11 +91,15 @@ class TextRowReader : public dwio::common::RowReader {
   using SetterFunction =
       std::function<void(VectorPtr&, vector_size_t, std::string_view)>;
 
+  void processLine(RowVector* result, int32_t row, std::string_view line);
+
   SetterFunction makeSetter(const TypePtr& type);
 
+  template <TypeKind Kind>
+  SetterFunction makePrimitiveSetter();
+
   void writeRowValue(
-      const std::vector<std::function<
-          void(VectorPtr&, vector_size_t, std::string_view)>>& childSetters,
+      const std::vector<SetterFunction>& childSetters,
       VectorPtr& vector,
       vector_size_t row,
       std::string_view value) const;
@@ -105,8 +109,6 @@ class TextRowReader : public dwio::common::RowReader {
       VectorPtr& columnVector,
       int32_t row,
       std::string_view value) const;
-
-  void processLine(RowVector* result, int32_t row, std::string_view line);
 
   template <TypeKind KIND>
   typename TypeTraits<KIND>::NativeType castFromString(

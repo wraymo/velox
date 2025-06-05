@@ -196,6 +196,82 @@ void TextRowReader::processLine(
   }
 }
 
+TextRowReader::SetterFunction TextRowReader::makeSetter(const TypePtr& type) {
+  switch (type->kind()) {
+    case TypeKind::BOOLEAN:
+      return makePrimitiveSetter<TypeKind::BOOLEAN>();
+    case TypeKind::TINYINT:
+      return makePrimitiveSetter<TypeKind::TINYINT>();
+    case TypeKind::SMALLINT:
+      return makePrimitiveSetter<TypeKind::SMALLINT>();
+    case TypeKind::INTEGER:
+      if (type->isDate()) {
+        return [](VectorPtr& vec, vector_size_t row, std::string_view val) {
+          auto flat = vec->as<FlatVector<int32_t>>();
+          if (val.empty()) {
+            flat->setNull(row, true);
+          } else {
+            flat->set(row, castFromDateString(val));
+          }
+        };
+      } else {
+        return makePrimitiveSetter<TypeKind::INTEGER>();
+      }
+    case TypeKind::BIGINT:
+      return makePrimitiveSetter<TypeKind::BIGINT>();
+    case TypeKind::REAL:
+      return makePrimitiveSetter<TypeKind::REAL>();
+    case TypeKind::DOUBLE:
+      return makePrimitiveSetter<TypeKind::DOUBLE>();
+    case TypeKind::TIMESTAMP:
+      return makePrimitiveSetter<TypeKind::TIMESTAMP>();
+    case TypeKind::VARCHAR:
+      return [](VectorPtr& vec, vector_size_t row, std::string_view val) {
+        vec->as<FlatVector<StringView>>()->set(
+            row, StringView(val.data(), val.size()));
+      };
+    case TypeKind::VARBINARY:
+      return [](VectorPtr& vec, vector_size_t row, std::string_view val) {
+        auto decodedValue = encoding::Base64::decode({val.data(), val.size()});
+        vec->as<FlatVector<StringView>>()->set(row, StringView(decodedValue));
+      };
+    case TypeKind::ARRAY: {
+      auto arrayType = std::dynamic_pointer_cast<const ArrayType>(type);
+      auto elementSetter = makeSetter(arrayType->elementType());
+      return [this, arrayType, elementSetter = std::move(elementSetter)](
+                 VectorPtr& vector, vector_size_t row, std::string_view value) {
+        writeArrayValue(elementSetter, vector, row, value);
+      };
+    }
+    case TypeKind::ROW: {
+      auto rowType = std::dynamic_pointer_cast<const RowType>(type);
+      std::vector<SetterFunction> childSetters;
+      for (auto& child : rowType->children()) {
+        childSetters.push_back(makeSetter(child));
+      }
+      return [this, childSetters = std::move(childSetters)](
+                 VectorPtr& vector, vector_size_t row, std::string_view value) {
+        writeRowValue(childSetters, vector, row, value);
+      };
+    }
+    default:
+      VELOX_UNSUPPORTED("Unsupported type: {}", type->toString());
+  }
+}
+
+template <TypeKind Kind>
+TextRowReader::SetterFunction TextRowReader::makePrimitiveSetter() {
+  return [this](VectorPtr& vec, vector_size_t row, std::string_view val) {
+    using TCpp = typename TypeTraits<Kind>::NativeType;
+    auto flat = vec->as<FlatVector<TCpp>>();
+    if (val.empty()) {
+      flat->setNull(row, true);
+    } else {
+      flat->set(row, castFromString<Kind>(val));
+    }
+  };
+}
+
 void TextRowReader::writeRowValue(
     const std::vector<SetterFunction>& childSetters,
     VectorPtr& vector,
@@ -230,86 +306,6 @@ void TextRowReader::writeRowValue(
 
   for (auto i = columnIndex; i < childrenSize; ++i) {
     children[i]->setNull(row, true);
-  }
-}
-
-TextRowReader::SetterFunction TextRowReader::makeSetter(const TypePtr& type) {
-  switch (type->kind()) {
-    case TypeKind::BOOLEAN:
-      return [this](VectorPtr& vec, vector_size_t row, std::string_view val) {
-        vec->as<FlatVector<bool>>()->set(
-            row, castFromString<TypeKind::BOOLEAN>(val));
-      };
-    case TypeKind::TINYINT:
-      return [this](VectorPtr& vec, vector_size_t row, std::string_view val) {
-        vec->as<FlatVector<int8_t>>()->set(
-            row, castFromString<TypeKind::TINYINT>(val));
-      };
-    case TypeKind::SMALLINT:
-      return [this](VectorPtr& vec, vector_size_t row, std::string_view val) {
-        vec->as<FlatVector<int16_t>>()->set(
-            row, castFromString<TypeKind::SMALLINT>(val));
-      };
-    case TypeKind::INTEGER:
-      return [this, isDate = type->isDate()](
-                 VectorPtr& vec, vector_size_t row, std::string_view val) {
-        auto flat = vec->as<FlatVector<int32_t>>();
-        flat->set(
-            row,
-            isDate ? castFromDateString(val)
-                   : castFromString<TypeKind::INTEGER>(val));
-      };
-    case TypeKind::BIGINT:
-      return [this](VectorPtr& vec, vector_size_t row, std::string_view val) {
-        vec->as<FlatVector<int64_t>>()->set(
-            row, castFromString<TypeKind::BIGINT>(val));
-      };
-    case TypeKind::REAL:
-      return [this](VectorPtr& vec, vector_size_t row, std::string_view val) {
-        vec->as<FlatVector<float>>()->set(
-            row, castFromString<TypeKind::REAL>(val));
-      };
-    case TypeKind::DOUBLE:
-      return [this](VectorPtr& vec, vector_size_t row, std::string_view val) {
-        vec->as<FlatVector<double>>()->set(
-            row, castFromString<TypeKind::DOUBLE>(val));
-      };
-    case TypeKind::VARCHAR:
-      return [](VectorPtr& vec, vector_size_t row, std::string_view val) {
-        vec->as<FlatVector<StringView>>()->set(
-            row, StringView(val.data(), val.size()));
-      };
-    case TypeKind::VARBINARY:
-      return [](VectorPtr& vec, vector_size_t row, std::string_view val) {
-        auto decodedValue = encoding::Base64::decode({val.data(), val.size()});
-        vec->as<FlatVector<StringView>>()->set(row, StringView(decodedValue));
-      };
-    case TypeKind::TIMESTAMP:
-      return [this](VectorPtr& vec, vector_size_t row, std::string_view val) {
-        vec->as<FlatVector<Timestamp>>()->set(
-            row, castFromString<TypeKind::TIMESTAMP>(val));
-      };
-    case TypeKind::ARRAY: {
-      auto arrayType = std::dynamic_pointer_cast<const ArrayType>(type);
-      auto elementSetter = makeSetter(arrayType->elementType());
-      return [this, arrayType, elementSetter = std::move(elementSetter)](
-                 VectorPtr& vector, vector_size_t row, std::string_view value) {
-        writeArrayValue(elementSetter, vector, row, value);
-      };
-    }
-    case TypeKind::ROW: {
-      auto rowType = std::dynamic_pointer_cast<const RowType>(type);
-      std::vector<SetterFunction> childSetters;
-      for (auto& child : rowType->children()) {
-        childSetters.push_back(makeSetter(child));
-      }
-      return [this, childSetters = std::move(childSetters)](
-                 VectorPtr& vector, vector_size_t row, std::string_view value) {
-        writeRowValue(childSetters, vector, row, value);
-      };
-    }
-    default:
-      VELOX_UNSUPPORTED("Unsupported type: {}", type->toString());
   }
 }
 
