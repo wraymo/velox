@@ -57,9 +57,10 @@ TextRowReader::TextRowReader(
       fieldDelim_{readerBase_->serdeOptions().separators[0]},
       collectionDelim_{readerBase_->serdeOptions().separators[1]},
       row_{0},
-      fileLength_{readerBase_->fileLength()},
-      fileOffset_{0},
-      blockEndOffset_{0},
+      skipRows_{options.skipRows()},
+      dataOffset_{options.offset()},
+      dataEndOffset_{dataOffset_ + options.length()},
+      blockEndOffset_{dataOffset_},
       bufferPtr_{nullptr},
       bufferSize_{0},
       bufferOffset_{0} {
@@ -92,14 +93,14 @@ uint64_t TextRowReader::next(
   int32_t row = 0;
   while (row < size) {
     // Load new block if needed
-    if (fileOffset_ == blockEndOffset_) {
-      if (fileOffset_ >= fileLength_) {
+    if (dataOffset_ == blockEndOffset_) {
+      if (dataOffset_ >= dataEndOffset_) {
         break; // EOF
       }
 
-      auto readSize = std::min(kBlockSize, fileLength_ - fileOffset_);
-      stream_ = readerBase_->loadBlock({fileOffset_, readSize});
-      blockEndOffset_ = fileOffset_ + readSize;
+      auto readSize = std::min(kBlockSize, dataEndOffset_ - dataOffset_);
+      stream_ = readerBase_->loadBlock({dataOffset_, readSize});
+      blockEndOffset_ = dataOffset_ + readSize;
 
       // Reset buffer state
       bufferPtr_ = nullptr;
@@ -129,19 +130,28 @@ uint64_t TextRowReader::next(
 
       if (!leftover_.empty()) {
         leftover_.append(remainingStr, 0, end);
-        processLine(rowResult, row, leftover_);
+        if (skipRows_ > 0) {
+          --skipRows_;
+        } else {
+          processLine(rowResult, row, leftover_);
+          ++row;
+        }
         leftover_.clear();
       } else {
-        processLine(rowResult, row, remainingStr.substr(0, end));
+        if (skipRows_ > 0) {
+          --skipRows_;
+        } else {
+          processLine(rowResult, row, remainingStr.substr(0, end));
+          ++row;
+        }
       }
 
       remainingStr.remove_prefix(end + 1);
-      ++row;
     }
 
     bufferOffset_ = bufferSize_ - remainingStr.size();
     if (bufferOffset_ >= bufferSize_) {
-      fileOffset_ += bufferSize_;
+      dataOffset_ += bufferSize_;
     }
   }
 
@@ -155,7 +165,7 @@ uint64_t TextRowReader::next(
 }
 
 int64_t TextRowReader::nextReadSize(uint64_t size) {
-  if (fileOffset_ >= fileLength_) {
+  if (dataOffset_ >= dataEndOffset_) {
     return kAtEnd;
   } else {
     return 0;

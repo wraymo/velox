@@ -133,8 +133,9 @@ class TextRowReader : public dwio::common::RowReader {
   uint8_t collectionDelim_;
 
   uint64_t row_;
-  uint64_t fileLength_;
-  uint64_t fileOffset_;
+  uint64_t skipRows_;
+  uint64_t dataOffset_;
+  uint64_t dataEndOffset_;
   uint64_t blockEndOffset_;
   std::string leftover_;
 
