@@ -50,9 +50,6 @@ TextRowReader::TextRowReader(
     const std::shared_ptr<ReaderBase>& reader,
     const dwio::common::RowReaderOptions& options)
     : readerBase_(reader),
-      requestedType_{
-          options.requestedType() ? options.requestedType()
-                                  : readerBase_->schema()},
       fileSchema_{readerBase_->schema()},
       fieldDelim_{readerBase_->serdeOptions().separators[0]},
       collectionDelim_{readerBase_->serdeOptions().separators[1]},
@@ -63,9 +60,14 @@ TextRowReader::TextRowReader(
       blockEndOffset_{dataOffset_},
       bufferPtr_{nullptr},
       bufferSize_{0},
-      bufferOffset_{0} {
-  std::vector<std::string> names;
-  std::vector<TypePtr> types;
+      bufferOffset_{0},
+      fileLength_{readerBase_->fileLength()} {
+  if (dataOffset_ == 0) {
+    skippedPartialStartLine_ = true;
+  } else {
+    skippedPartialStartLine_ = false;
+  }
+
   auto& scanSpec = options.scanSpec();
   auto& childSpecs = scanSpec->children();
   for (const auto& childSpec : childSpecs) {
@@ -87,18 +89,30 @@ uint64_t TextRowReader::next(
     uint64_t size,
     VectorPtr& result,
     const dwio::common::Mutation* /*mutation*/) {
+  if (dataOffset_ > dataEndOffset_) {
+    // If we already passed the split boundary, we should not read any more
+    // rows.
+    return 0;
+  }
+
   auto rowResult = result->as<RowVector>();
   rowResult->ensureWritable(SelectivityVector(size, true));
 
   int32_t row = 0;
+  bool pastSplitBoundary = false;
+
   while (row < size) {
     // Load new block if needed
     if (dataOffset_ == blockEndOffset_) {
-      if (dataOffset_ >= dataEndOffset_) {
-        break; // EOF
+      size_t readSize = 0;
+      if (dataOffset_ < dataEndOffset_) {
+        // Read normal block size or remaining bytes in split
+        readSize = std::min(kBlockSize, dataEndOffset_ - dataOffset_);
+      } else {
+        // Past split boundary: read extra block to finish last row
+        readSize = std::min(kBlockSize, fileLength_ - dataOffset_);
       }
 
-      auto readSize = std::min(kBlockSize, dataEndOffset_ - dataOffset_);
       stream_ = readerBase_->loadBlock({dataOffset_, readSize});
       blockEndOffset_ = dataOffset_ + readSize;
 
@@ -117,6 +131,30 @@ uint64_t TextRowReader::next(
       bufferOffset_ = 0;
     }
 
+    // Skip first partial row if not yet skipped
+    if (!skippedPartialStartLine_) {
+      std::string_view remainingStr(
+          bufferPtr_ + bufferOffset_, bufferSize_ - bufferOffset_);
+      if (remainingStr.empty()) {
+        // If the buffer is empty, we can't skip anything
+        continue;
+      }
+      // If the first row is partial, skip it
+      auto end = remainingStr.find(TextFileTraits::kNewLine);
+      if (end != std::string::npos) {
+        // Move offset past the newline
+        auto skipLen = end + 1;
+        bufferOffset_ += skipLen;
+        dataOffset_ += skipLen;
+        skippedPartialStartLine_ = true;
+      } else {
+        // No newline found, skip entire buffer
+        dataOffset_ += remainingStr.size();
+        bufferOffset_ = bufferSize_;
+        continue;
+      }
+    }
+
     // Parse lines from current buffer
     std::string_view remainingStr(
         bufferPtr_ + bufferOffset_, bufferSize_ - bufferOffset_);
@@ -124,7 +162,8 @@ uint64_t TextRowReader::next(
       auto end = remainingStr.find(TextFileTraits::kNewLine);
       if (end == std::string::npos) {
         leftover_.append(remainingStr);
-        remainingStr = std::string_view();
+        bufferOffset_ = bufferSize_;
+        dataOffset_ += remainingStr.size();
         break;
       }
 
@@ -146,12 +185,22 @@ uint64_t TextRowReader::next(
         }
       }
 
+      // Advance buffer and data offsets past this line (+1 for newline)
+      bufferOffset_ += end + 1;
+      dataOffset_ += end + 1;
+
       remainingStr.remove_prefix(end + 1);
+
+      if (dataOffset_ > dataEndOffset_) {
+        pastSplitBoundary = true;
+        break;
+      }
     }
 
-    bufferOffset_ = bufferSize_ - remainingStr.size();
-    if (bufferOffset_ >= bufferSize_) {
-      dataOffset_ += bufferSize_;
+    if (pastSplitBoundary) {
+      // Stop reading new rows once the first full row past boundary is
+      // processed
+      break;
     }
   }
 
@@ -165,7 +214,7 @@ uint64_t TextRowReader::next(
 }
 
 int64_t TextRowReader::nextReadSize(uint64_t size) {
-  if (dataOffset_ >= dataEndOffset_) {
+  if (dataOffset_ > dataEndOffset_) {
     return kAtEnd;
   } else {
     return 0;
@@ -355,6 +404,9 @@ template <TypeKind KIND>
 typename TypeTraits<KIND>::NativeType TextRowReader::castFromString(
     const std::string_view& value) {
   auto result = util::Converter<KIND>::tryCast(folly::StringPiece(value));
+  if (result.hasError()) {
+    VELOX_FAIL("TextRowReader: '{}'", result.error().message());
+  }
   VELOX_CHECK(!result.hasError());
   return result.value();
 }
@@ -362,6 +414,9 @@ typename TypeTraits<KIND>::NativeType TextRowReader::castFromString(
 int32_t TextRowReader::castFromDateString(const std::string_view& value) {
   auto result = util::fromDateString(
       value.data(), value.size(), util::ParseMode::kPrestoCast);
+  if (result.hasError()) {
+    VELOX_FAIL("TextRowReader: '{}'", result.error().message());
+  }
   VELOX_CHECK(!result.hasError());
   return result.value();
 }

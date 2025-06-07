@@ -121,8 +121,6 @@ class TextRowReader : public dwio::common::RowReader {
   std::shared_ptr<ReaderBase> readerBase_;
   std::unique_ptr<dwio::common::SeekableInputStream> stream_;
 
-  RowTypePtr requestedType_;
-  RowTypePtr outputType_;
   RowTypePtr fileSchema_;
 
   std::unordered_map<uint32_t, std::pair<uint32_t, SetterFunction>>
@@ -142,6 +140,10 @@ class TextRowReader : public dwio::common::RowReader {
   const char* bufferPtr_;
   int32_t bufferSize_;
   int32_t bufferOffset_;
+
+  uint64_t fileLength_;
+
+  bool skippedPartialStartLine_;
 };
 
 class TextReader : public dwio::common::Reader {
