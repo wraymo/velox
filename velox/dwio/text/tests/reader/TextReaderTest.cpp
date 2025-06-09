@@ -41,7 +41,7 @@ class TextReaderTest : public testing::Test,
 
  protected:
   static void SetUpTestCase() {
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
   std::string getExampleFilePath(const std::string& fileName) {
@@ -64,6 +64,9 @@ class TextReaderTest : public testing::Test,
         std::move(input), std::move(readerOptions));
 
     dwio::common::RowReaderOptions rowReaderOpts;
+    auto scanSpec = std::make_shared<velox::common::ScanSpec>("");
+    scanSpec->addAllChildFields(*schema);
+    rowReaderOpts.setScanSpec(scanSpec);
     auto rowReader = reader->createRowReader(rowReaderOpts);
     return rowReader;
   }
@@ -106,7 +109,7 @@ TEST_F(TextReaderTest, read) {
           makeFlatVector<StringView>({"hello", "world", "cpp"}, VARBINARY()),
       });
 
-  VectorPtr actual;
+  auto actual = BaseVector::create(schema, 10, leafPool_.get());
   auto result = rowReader->next(3, actual);
   ASSERT_EQ(result, 3);
   ASSERT_EQ(actual->size(), 3);

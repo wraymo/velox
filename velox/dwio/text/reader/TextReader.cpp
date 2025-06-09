@@ -55,18 +55,14 @@ TextRowReader::TextRowReader(
       collectionDelim_{readerBase_->serdeOptions().separators[1]},
       row_{0},
       skipRows_{options.skipRows()},
+      fileLength_{readerBase_->fileLength()},
       dataOffset_{options.offset()},
-      dataEndOffset_{dataOffset_ + options.length()},
+      dataEndOffset_{std::min(dataOffset_ + options.length(), fileLength_)},
       blockEndOffset_{dataOffset_},
       bufferPtr_{nullptr},
       bufferSize_{0},
-      bufferOffset_{0},
-      fileLength_{readerBase_->fileLength()} {
-  if (dataOffset_ == 0) {
-    skippedPartialStartLine_ = true;
-  } else {
-    skippedPartialStartLine_ = false;
-  }
+      bufferOffset_{0} {
+  skippedPartialStartLine_ = dataOffset_ == 0 ? true : false;
 
   auto& scanSpec = options.scanSpec();
   auto& childSpecs = scanSpec->children();
@@ -89,7 +85,7 @@ uint64_t TextRowReader::next(
     uint64_t size,
     VectorPtr& result,
     const dwio::common::Mutation* /*mutation*/) {
-  if (dataOffset_ > dataEndOffset_) {
+  if (dataOffset_ > dataEndOffset_ || dataOffset_ >= fileLength_) {
     // If we already passed the split boundary, we should not read any more
     // rows.
     return 0;
@@ -109,8 +105,8 @@ uint64_t TextRowReader::next(
         // Read normal block size or remaining bytes in split
         readSize = std::min(kBlockSize, dataEndOffset_ - dataOffset_);
       } else {
-        // Past split boundary: read extra block to finish last row
-        readSize = std::min(kBlockSize, fileLength_ - dataOffset_);
+        // Past split boundary: read extra data to finish last row
+        readSize = std::min(kEstimatedRowSize, fileLength_ - dataOffset_);
       }
 
       stream_ = readerBase_->loadBlock({dataOffset_, readSize});

@@ -117,6 +117,7 @@ class TextRowReader : public dwio::common::RowReader {
   static int32_t castFromDateString(const std::string_view& value);
 
   static constexpr uint64_t kBlockSize = 1024 * 1024; // 1MB
+  static constexpr uint64_t kEstimatedRowSize = 1024; // 1KB
 
   std::shared_ptr<ReaderBase> readerBase_;
   std::unique_ptr<dwio::common::SeekableInputStream> stream_;
@@ -132,6 +133,8 @@ class TextRowReader : public dwio::common::RowReader {
 
   uint64_t row_;
   uint64_t skipRows_;
+
+  uint64_t fileLength_;
   uint64_t dataOffset_;
   uint64_t dataEndOffset_;
   uint64_t blockEndOffset_;
@@ -140,8 +143,6 @@ class TextRowReader : public dwio::common::RowReader {
   const char* bufferPtr_;
   int32_t bufferSize_;
   int32_t bufferOffset_;
-
-  uint64_t fileLength_;
 
   bool skippedPartialStartLine_;
 };
