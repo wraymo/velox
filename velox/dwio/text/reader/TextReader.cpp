@@ -53,6 +53,7 @@ TextRowReader::TextRowReader(
       fileSchema_{readerBase_->schema()},
       fieldDelim_{readerBase_->serdeOptions().separators[0]},
       collectionDelim_{readerBase_->serdeOptions().separators[1]},
+      mapKeyDelim_{readerBase_->serdeOptions().separators[2]},
       row_{0},
       skipRows_{options.skipRows()},
       fileLength_{readerBase_->fileLength()},
@@ -236,11 +237,7 @@ void TextRowReader::processLine(
     if (it != fileIndexToSetters_.end()) {
       auto channel = it->second.first;
       auto setter = it->second.second;
-      if (token == TextFileTraits::kNullData) {
-        result->childAt(channel)->setNull(row, true);
-      } else {
-        setter(result->childAt(channel), row, token);
-      }
+      setter(result->childAt(channel), row, token);
     }
 
     columnIndex++;
@@ -263,7 +260,7 @@ TextRowReader::SetterFunction TextRowReader::makeSetter(const TypePtr& type) {
       if (type->isDate()) {
         return [](VectorPtr& vec, vector_size_t row, std::string_view val) {
           auto flat = vec->as<FlatVector<int32_t>>();
-          if (val.empty()) {
+          if (val.empty() || TextFileTraits::kNullData == val) {
             flat->setNull(row, true);
           } else {
             flat->set(row, castFromDateString(val));
@@ -282,13 +279,22 @@ TextRowReader::SetterFunction TextRowReader::makeSetter(const TypePtr& type) {
       return makePrimitiveSetter<TypeKind::TIMESTAMP>();
     case TypeKind::VARCHAR:
       return [](VectorPtr& vec, vector_size_t row, std::string_view val) {
-        vec->as<FlatVector<StringView>>()->set(
-            row, StringView(val.data(), val.size()));
+        if (TextFileTraits::kNullData == val) {
+          vec->as<FlatVector<StringView>>()->setNull(row, true);
+        } else {
+          vec->as<FlatVector<StringView>>()->set(
+              row, StringView(val.data(), val.size()));
+        }
       };
     case TypeKind::VARBINARY:
       return [](VectorPtr& vec, vector_size_t row, std::string_view val) {
-        auto decodedValue = encoding::Base64::decode({val.data(), val.size()});
-        vec->as<FlatVector<StringView>>()->set(row, StringView(decodedValue));
+        if (TextFileTraits::kNullData == val) {
+          vec->as<FlatVector<StringView>>()->setNull(row, true);
+        } else {
+          auto decodedValue =
+              encoding::Base64::decode({val.data(), val.size()});
+          vec->as<FlatVector<StringView>>()->set(row, StringView(decodedValue));
+        }
       };
     case TypeKind::ARRAY: {
       auto arrayType = std::dynamic_pointer_cast<const ArrayType>(type);
@@ -309,6 +315,19 @@ TextRowReader::SetterFunction TextRowReader::makeSetter(const TypePtr& type) {
         writeRowValue(childSetters, vector, row, value);
       };
     }
+    case TypeKind::MAP: {
+      auto mapType = std::dynamic_pointer_cast<const MapType>(type);
+      auto keySetter = makeSetter(mapType->keyType());
+      auto valueSetter = makeSetter(mapType->valueType());
+
+      return [this,
+              keySetter = std::move(keySetter),
+              valueSetter = std::move(valueSetter),
+              mapType](
+                 VectorPtr& vector, vector_size_t row, std::string_view value) {
+        writeMapValue(keySetter, valueSetter, vector, row, value);
+      };
+    }
     default:
       VELOX_UNSUPPORTED("Unsupported type: {}", type->toString());
   }
@@ -319,49 +338,12 @@ TextRowReader::SetterFunction TextRowReader::makePrimitiveSetter() {
   return [this](VectorPtr& vec, vector_size_t row, std::string_view val) {
     using TCpp = typename TypeTraits<Kind>::NativeType;
     auto flat = vec->as<FlatVector<TCpp>>();
-    if (val.empty()) {
+    if (val.empty() || TextFileTraits::kNullData == val) {
       flat->setNull(row, true);
     } else {
       flat->set(row, castFromString<Kind>(val));
     }
   };
-}
-
-void TextRowReader::writeRowValue(
-    const std::vector<SetterFunction>& childSetters,
-    VectorPtr& vector,
-    vector_size_t row,
-    std::string_view value) const {
-  auto rowVector = vector->as<RowVector>();
-  auto& children = rowVector->children();
-
-  std::size_t columnIndex = 0;
-  std::size_t start = 0;
-
-  auto childrenSize = children.size();
-  auto valueSize = value.size();
-  while (columnIndex < childrenSize && start <= valueSize) {
-    VELOX_CHECK_LT(columnIndex, childrenSize, "Too many columns in line");
-
-    std::size_t end = value.find(collectionDelim_, start);
-    bool isLast = (end == std::string::npos);
-    std::string_view token =
-        isLast ? value.substr(start) : value.substr(start, end - start);
-    if (token == TextFileTraits::kNullData) {
-      children[columnIndex]->setNull(row, true);
-    } else {
-      childSetters[columnIndex](children[columnIndex], row, token);
-    }
-    columnIndex++;
-    if (isLast) {
-      break;
-    }
-    start = end + 1;
-  }
-
-  for (auto i = columnIndex; i < childrenSize; ++i) {
-    children[i]->setNull(row, true);
-  }
 }
 
 void TextRowReader::writeArrayValue(
@@ -394,6 +376,102 @@ void TextRowReader::writeArrayValue(
   }
 
   arrayVector->setOffsetAndSize(row, offset, length);
+}
+
+void TextRowReader::writeRowValue(
+    const std::vector<SetterFunction>& childSetters,
+    VectorPtr& vector,
+    vector_size_t row,
+    std::string_view value) const {
+  auto rowVector = vector->as<RowVector>();
+  auto& children = rowVector->children();
+
+  std::size_t columnIndex = 0;
+  std::size_t start = 0;
+
+  auto childrenSize = children.size();
+  auto valueSize = value.size();
+  while (columnIndex < childrenSize && start <= valueSize) {
+    std::size_t end = value.find(collectionDelim_, start);
+    bool isLast = (end == std::string::npos);
+    std::string_view token =
+        isLast ? value.substr(start) : value.substr(start, end - start);
+    if (token == TextFileTraits::kNullData) {
+      children[columnIndex]->setNull(row, true);
+    } else {
+      childSetters[columnIndex](children[columnIndex], row, token);
+    }
+    columnIndex++;
+    if (isLast) {
+      break;
+    }
+    start = end + 1;
+  }
+
+  for (auto i = columnIndex; i < childrenSize; ++i) {
+    children[i]->setNull(row, true);
+  }
+}
+
+void TextRowReader::writeMapValue(
+    const SetterFunction& keySetter,
+    const SetterFunction& valueSetter,
+    VectorPtr& vector,
+    vector_size_t row,
+    std::string_view value) const {
+  auto* mapVector = vector->as<MapVector>();
+  if (value.empty()) {
+    mapVector->setNull(row, true);
+    return;
+  }
+
+  auto& keyVector = mapVector->mapKeys();
+  auto& valueVector = mapVector->mapValues();
+  std::vector<std::pair<std::string_view, std::string_view>> entries;
+
+  std::size_t start = 0;
+  while (start <= value.size()) {
+    std::size_t entryEnd = value.find(collectionDelim_, start);
+    bool isLast = (entryEnd == std::string::npos);
+    if (isLast) {
+      entryEnd = value.size();
+    }
+
+    std::string_view key;
+    std::string_view val;
+    std::size_t kvSep = value.find(mapKeyDelim_, start);
+    if (kvSep == std::string::npos || kvSep >= entryEnd) {
+      // No key-value delimiter found, treat entire token as key, value=null
+      key = value.substr(start, entryEnd - start);
+      val = TextFileTraits::kNullData;
+    } else {
+      key = value.substr(start, kvSep - start);
+      val = value.substr(kvSep + 1, entryEnd - kvSep - 1);
+    }
+
+    // Skip entry if key is null representation ("\N")
+    if (key != TextFileTraits::kNullData) {
+      entries.emplace_back(key, val);
+    }
+
+    if (isLast) {
+      break;
+    }
+    start = entryEnd + 1;
+  }
+
+  const vector_size_t offset = keyVector->size();
+  const vector_size_t length = entries.size();
+
+  keyVector->resize(offset + length);
+  valueVector->resize(offset + length);
+
+  for (size_t i = 0; i < length; ++i) {
+    keySetter(keyVector, offset + i, entries[i].first);
+    valueSetter(valueVector, offset + i, entries[i].second);
+  }
+
+  mapVector->setOffsetAndSize(row, offset, length);
 }
 
 template <TypeKind KIND>

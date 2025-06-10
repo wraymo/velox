@@ -98,16 +98,23 @@ class TextRowReader : public dwio::common::RowReader {
   template <TypeKind Kind>
   SetterFunction makePrimitiveSetter();
 
+  void writeArrayValue(
+      const SetterFunction& setter,
+      VectorPtr& columnVector,
+      int32_t row,
+      std::string_view value) const;
+
   void writeRowValue(
       const std::vector<SetterFunction>& childSetters,
       VectorPtr& vector,
       vector_size_t row,
       std::string_view value) const;
 
-  void writeArrayValue(
-      const SetterFunction& setter,
-      VectorPtr& columnVector,
-      int32_t row,
+  void writeMapValue(
+      const SetterFunction& keySetter,
+      const SetterFunction& valueSetter,
+      VectorPtr& vector,
+      vector_size_t row,
       std::string_view value) const;
 
   template <TypeKind KIND>
@@ -130,6 +137,7 @@ class TextRowReader : public dwio::common::RowReader {
 
   uint8_t fieldDelim_;
   uint8_t collectionDelim_;
+  uint8_t mapKeyDelim_;
 
   uint64_t row_;
   uint64_t skipRows_;
